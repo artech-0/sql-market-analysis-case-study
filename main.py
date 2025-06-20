@@ -1,5 +1,3 @@
-# retail_dashboard.py
-
 import streamlit as st
 import sqlite3
 import pandas as pd
@@ -98,7 +96,7 @@ def load_data():
     """
     customer_quantiles_df = pd.read_sql(customer_quantile_values_q, conn)
 
-    # *** CORRECTED QUERY FOR BEHAVIORAL THRESHOLDS ***
+    
     customer_behaviour_segments_q = f"""
     {customers_CTE_query},
     TransactionGaps AS (
