@@ -22,7 +22,7 @@ def load_data():
     customers.to_sql('Customers', conn, if_exists='replace', index=False)
     products.to_sql('Products', conn, if_exists='replace', index=False)
     sales.to_sql('Sales', conn, if_exists='replace', index=False)
-
+    
     sales_CTE_query = """
     WITH sales_cleaned AS (
       SELECT * FROM (
@@ -31,6 +31,7 @@ def load_data():
       ) WHERE row_num = 1
     )
     """
+    # the idea is to de-duplicate on the basis of these fields, so we select the first
     
     customers_CTE_query = f"""
     {sales_CTE_query},
@@ -39,6 +40,7 @@ def load_data():
       FROM Customers
     )
     """
+    # it handles the null values and replaces them with a string literal
 
     revenue_q = f"""
     {sales_CTE_query}
@@ -97,42 +99,42 @@ def load_data():
     customer_quantiles_df = pd.read_sql(customer_quantile_values_q, conn)
 
     segment_revenue_analysis = f"""
-{sales_CTE_query},
-CustomerSegmentation AS (
+    {sales_CTE_query},
+    CustomerSegmentation AS (
 
+        SELECT
+            c.CustomerID,
+            SUM(s.QuantityPurchased * p.Price) AS TotalSpend,
+            CASE
+                WHEN SUM(s.QuantityPurchased * p.Price) > {customer_quantiles_df['P99_Threshold'][0]} THEN 'Diamond'
+                WHEN SUM(s.QuantityPurchased * p.Price) > {customer_quantiles_df['P95_Threshold'][0]} THEN 'Platinum'
+                WHEN SUM(s.QuantityPurchased * p.Price) > {customer_quantiles_df['P90_Threshold'][0]} THEN 'Gold'
+                WHEN SUM(s.QuantityPurchased * p.Price) > {customer_quantiles_df['P75_Threshold'][0]}  THEN 'Silver'
+                ELSE 'Bronze'
+            END AS CustomerSegment
+        FROM
+            customers c
+        JOIN
+            sales_cleaned s ON c.CustomerID = s.CustomerID
+        JOIN
+            products p ON s.ProductID = p.ProductID
+        GROUP BY
+            c.CustomerID
+    )
+    -- Now, we aggregate the results of the segmentation
     SELECT
-        c.CustomerID,
-        SUM(s.QuantityPurchased * p.Price) AS TotalSpend,
-        CASE
-            WHEN SUM(s.QuantityPurchased * p.Price) > {customer_quantiles_df['P99_Threshold'][0]} THEN 'Diamond'
-            WHEN SUM(s.QuantityPurchased * p.Price) > {customer_quantiles_df['P95_Threshold'][0]} THEN 'Platinum'
-            WHEN SUM(s.QuantityPurchased * p.Price) > {customer_quantiles_df['P90_Threshold'][0]} THEN 'Gold'
-            WHEN SUM(s.QuantityPurchased * p.Price) > {customer_quantiles_df['P75_Threshold'][0]}  THEN 'Silver'
-            ELSE 'Bronze'
-        END AS CustomerSegment
+        CustomerSegment,
+        COUNT(CustomerID) AS NumberOfCustomers,
+        SUM(TotalSpend) AS TotalRevenueBySegment,
+        -- Also calculate the percentage of total revenue for context
+        (SUM(TotalSpend) * 100.0 / (SELECT SUM(TotalSpend) FROM CustomerSegmentation)) AS PercentageOfTotalRevenue
     FROM
-        customers c
-    JOIN
-        sales_cleaned s ON c.CustomerID = s.CustomerID
-    JOIN
-        products p ON s.ProductID = p.ProductID
+        CustomerSegmentation
     GROUP BY
-        c.CustomerID
-)
--- Now, we aggregate the results of the segmentation
-SELECT
-    CustomerSegment,
-    COUNT(CustomerID) AS NumberOfCustomers,
-    SUM(TotalSpend) AS TotalRevenueBySegment,
-    -- Also calculate the percentage of total revenue for context
-    (SUM(TotalSpend) * 100.0 / (SELECT SUM(TotalSpend) FROM CustomerSegmentation)) AS PercentageOfTotalRevenue
-FROM
-    CustomerSegmentation
-GROUP BY
-    CustomerSegment
-ORDER BY
-    TotalRevenueBySegment DESC;
-"""
+        CustomerSegment
+    ORDER BY
+        TotalRevenueBySegment DESC;
+    """
     segment_value_df = pd.read_sql(segment_revenue_analysis, conn)
     
     customer_behaviour_segments_q = f"""
@@ -169,79 +171,107 @@ ORDER BY
     customer_behaviour_segments_df = pd.read_sql(customer_behaviour_segments_q, conn)
     
     visualization_data_q = f"""
-WITH
-  sales_cleaned AS (
-    SELECT * FROM (
-        SELECT *, ROW_NUMBER() OVER(PARTITION BY CustomerID, ProductID, QuantityPurchased, TransactionDate, Price ORDER BY TransactionID) as rn
-        FROM sales
-    ) WHERE rn = 1
-  ),
-  CustomerValue AS (
-    SELECT
-        s.CustomerID,
-        SUM(p.Price * s.QuantityPurchased) AS TotalSpend
-    FROM sales_cleaned s
-    JOIN products p ON s.ProductID = p.ProductID
-    GROUP BY s.CustomerID
-  ),
-  CustomerFrequency AS (
-    SELECT
-        CustomerID,
-        AVG(DaysSinceLastPurchase) AS AvgDaysBetweenPurchases
-    FROM (
+    WITH
+    sales_cleaned AS (
+        SELECT * FROM (
+            SELECT *, ROW_NUMBER() OVER(PARTITION BY CustomerID, ProductID, QuantityPurchased, TransactionDate, Price ORDER BY TransactionID) as rn
+            FROM sales
+        ) WHERE rn = 1
+    ),
+    CustomerValue AS (
+        SELECT
+            s.CustomerID,
+            SUM(p.Price * s.QuantityPurchased) AS TotalSpend
+        FROM sales_cleaned s
+        JOIN products p ON s.ProductID = p.ProductID
+        GROUP BY s.CustomerID
+    ),
+    CustomerFrequency AS (
         SELECT
             CustomerID,
-            JULIANDAY(DATE('20' || SUBSTR(TransactionDate, 7, 2) || '-' || SUBSTR(TransactionDate, 4, 2) || '-' || SUBSTR(TransactionDate, 1, 2))) -
-            JULIANDAY(LAG(DATE('20' || SUBSTR(TransactionDate, 7, 2) || '-' || SUBSTR(TransactionDate, 4, 2) || '-' || SUBSTR(TransactionDate, 1, 2)), 1)
-            OVER (PARTITION BY CustomerID ORDER BY DATE('20' || SUBSTR(TransactionDate, 7, 2) || '-' || SUBSTR(TransactionDate, 4, 2) || '-' || SUBSTR(TransactionDate, 1, 2))))
-            AS DaysSinceLastPurchase
-        FROM sales_cleaned
+            AVG(DaysSinceLastPurchase) AS AvgDaysBetweenPurchases
+        FROM (
+            SELECT
+                CustomerID,
+                JULIANDAY(DATE('20' || SUBSTR(TransactionDate, 7, 2) || '-' || SUBSTR(TransactionDate, 4, 2) || '-' || SUBSTR(TransactionDate, 1, 2))) -
+                JULIANDAY(LAG(DATE('20' || SUBSTR(TransactionDate, 7, 2) || '-' || SUBSTR(TransactionDate, 4, 2) || '-' || SUBSTR(TransactionDate, 1, 2)), 1)
+                OVER (PARTITION BY CustomerID ORDER BY DATE('20' || SUBSTR(TransactionDate, 7, 2) || '-' || SUBSTR(TransactionDate, 4, 2) || '-' || SUBSTR(TransactionDate, 1, 2))))
+                AS DaysSinceLastPurchase
+            FROM sales_cleaned
+        )
+        WHERE DaysSinceLastPurchase IS NOT NULL
+        GROUP BY CustomerID
+    ),
+    FinalCustomerMatrix AS (
+        -- This is the corrected CTE without the unnecessary subquery
+        SELECT
+            c.CustomerID,
+            val.TotalSpend,
+            -- Corrected ValueSegment Logic
+            CASE
+                WHEN val.TotalSpend > {customer_quantiles_df['P99_Threshold'][0]} THEN 'Diamond'
+                WHEN val.TotalSpend > {customer_quantiles_df['P95_Threshold'][0]} THEN 'Platinum'
+                WHEN val.TotalSpend > {customer_quantiles_df['P90_Threshold'][0]} THEN 'Gold'
+                WHEN val.TotalSpend > {customer_quantiles_df['P75_Threshold'][0]} THEN 'Silver'
+                WHEN val.TotalSpend IS NOT NULL THEN 'Bronze'
+                ELSE 'Inactive'
+            END AS ValueSegment,
+            -- Corrected FrequencySegment Logic
+            CASE
+                WHEN freq.AvgDaysBetweenPurchases <= {customer_behaviour_segments_df['P33_Threshold'][0]} THEN 'Frequent'
+                WHEN freq.AvgDaysBetweenPurchases <= {customer_behaviour_segments_df['P66_Threshold'][0]} THEN 'Regular'
+                WHEN freq.AvgDaysBetweenPurchases > {customer_behaviour_segments_df['P66_Threshold'][0]} THEN 'Infrequent'
+                WHEN val.TotalSpend IS NOT NULL THEN 'One-Time Buyer'
+                ELSE 'Inactive'
+            END AS FrequencySegment
+        FROM
+            customers c
+        LEFT JOIN
+            CustomerValue val ON c.CustomerID = val.CustomerID
+        LEFT JOIN
+            CustomerFrequency freq ON c.CustomerID = freq.CustomerID
     )
-    WHERE DaysSinceLastPurchase IS NOT NULL
-    GROUP BY CustomerID
-  ),
-  FinalCustomerMatrix AS (
-    -- This is the corrected CTE without the unnecessary subquery
+    -- The final aggregation for visualization
     SELECT
-        c.CustomerID,
-        val.TotalSpend,
-        -- Corrected ValueSegment Logic
-        CASE
-            WHEN val.TotalSpend > {customer_quantiles_df['P99_Threshold'][0]} THEN 'Diamond'
-            WHEN val.TotalSpend > {customer_quantiles_df['P95_Threshold'][0]} THEN 'Platinum'
-            WHEN val.TotalSpend > {customer_quantiles_df['P90_Threshold'][0]} THEN 'Gold'
-            WHEN val.TotalSpend > {customer_quantiles_df['P75_Threshold'][0]} THEN 'Silver'
-            WHEN val.TotalSpend IS NOT NULL THEN 'Bronze'
-            ELSE 'Inactive'
-        END AS ValueSegment,
-        -- Corrected FrequencySegment Logic
-        CASE
-            WHEN freq.AvgDaysBetweenPurchases <= {customer_behaviour_segments_df['P33_Threshold'][0]} THEN 'Frequent'
-            WHEN freq.AvgDaysBetweenPurchases <= {customer_behaviour_segments_df['P66_Threshold'][0]} THEN 'Regular'
-            WHEN freq.AvgDaysBetweenPurchases > {customer_behaviour_segments_df['P66_Threshold'][0]} THEN 'Infrequent'
-            WHEN val.TotalSpend IS NOT NULL THEN 'One-Time Buyer'
-            ELSE 'Inactive'
-        END AS FrequencySegment
+        ValueSegment,
+        FrequencySegment,
+        COUNT(CustomerID) AS CustomerCount,
+        SUM(TotalSpend) AS TotalRevenue
     FROM
-        customers c
-    LEFT JOIN
-        CustomerValue val ON c.CustomerID = val.CustomerID
-    LEFT JOIN
-        CustomerFrequency freq ON c.CustomerID = freq.CustomerID
-  )
--- The final aggregation for visualization
-SELECT
-    ValueSegment,
-    FrequencySegment,
-    COUNT(CustomerID) AS CustomerCount,
-    SUM(TotalSpend) AS TotalRevenue
-FROM
-    FinalCustomerMatrix
-GROUP BY
-    ValueSegment,
-    FrequencySegment
-"""
+        FinalCustomerMatrix
+    GROUP BY
+        ValueSegment,
+        FrequencySegment
+    """
     viz_df = pd.read_sql(visualization_data_q, conn)
+
+    
+
+    revenue_share_q = f"""
+    {sales_CTE_query},
+    product_revenue AS (
+      SELECT p.ProductID, p.ProductName, p.Category, SUM(s.QuantityPurchased * p.Price) AS TotalRevenue
+      FROM sales_cleaned s JOIN products p ON s.ProductID = p.ProductID
+      GROUP BY p.ProductID, p.ProductName, p.Category
+    )
+    SELECT ProductName, Category, TotalRevenue, (TotalRevenue / SUM(TotalRevenue) OVER()) * 100 AS RevenueSharePercentage
+    FROM product_revenue ORDER BY TotalRevenue DESC
+    """
+    product_share_df = pd.read_sql(revenue_share_q, conn)
+
+    category_share_q = f"""
+    {sales_CTE_query},
+    category_revenue AS (
+      SELECT p.Category, SUM(s.QuantityPurchased * p.Price) AS TotalRevenue
+      FROM sales_cleaned s JOIN products p ON s.ProductID = p.ProductID
+      GROUP BY p.Category
+    )
+    SELECT Category, TotalRevenue, (TotalRevenue / SUM(TotalRevenue) OVER()) * 100 AS RevenueSharePercentage
+    FROM category_revenue ORDER BY TotalRevenue DESC
+    """
+    category_share_df = pd.read_sql(category_share_q, conn)
+
+    
 
     conn.close()
     
@@ -252,7 +282,9 @@ GROUP BY
         "quantile_results": quantile_results,
         "monthly_revenue_df": monthly_revenue_df,
         "viz_df": viz_df,
-        "segment_value_df": segment_value_df
+        "segment_value_df": segment_value_df,
+        "product_share_df": product_share_df,
+        "category_share_df": category_share_df
     }
 
 data = load_data()
@@ -312,6 +344,61 @@ def show_product_analysis():
     ax1.set_xlabel('Total Revenue ($)')
     ax1.set_ylabel('Product')
     st.pyplot(fig1)
+
+    st.divider()
+    st.header("Dissecting Our Revenue: A Diversified Portfolio is Our Strength")
+    st.markdown("""
+    While analyzing top products is useful, the bigger story is one of resilience and diversity. Our business is not dangerously reliant on a few 'hero' products or a single category. This is a significant competitive advantage.
+    """)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Revenue Share by Category")
+        category_share_df = data['category_share_df']
+        
+        fig2, ax2 = plt.subplots(figsize=(8, 8))
+        explode = [0.05] + [0] * (len(category_share_df) - 1)
+        ax2.pie(
+            category_share_df['RevenueSharePercentage'],
+            labels=category_share_df['Category'],
+            autopct='%1.1f%%',
+            startangle=90,
+            colors=sns.color_palette('viridis', len(category_share_df)),
+            explode=explode,
+            textprops={'fontsize': 12, 'color': 'white'}
+        )
+        ax2.set_title('Revenue Share by Category', fontsize=16)
+        st.pyplot(fig2)
+        st.markdown("**Insight:** Revenue is remarkably balanced across all four categories. This diversification mitigates risk; a slump in one category will not cripple the entire business.")
+
+
+    with col2:
+        st.subheader("The Diverse Portfolio of Products")
+        product_share_df = data['product_share_df']
+        top_n = 20
+        
+        top_products_for_pie = product_share_df.head(top_n).copy()
+        other_share = product_share_df.iloc[top_n:]['RevenueSharePercentage'].sum()
+        other_row = pd.DataFrame([{'ProductName': 'All Other Products', 'RevenueSharePercentage': other_share}])
+        treemap_df = pd.concat([top_products_for_pie, other_row], ignore_index=True)
+
+        fig3, ax3 = plt.subplots(figsize=(10, 8))
+        sizes = treemap_df['RevenueSharePercentage']
+        labels = [f"{name}\n({perc:.1f}%)" for name, perc in zip(treemap_df['ProductName'], treemap_df['RevenueSharePercentage'])]
+        
+        squarify.plot(
+            sizes=sizes,
+            label=labels,
+            color=sns.color_palette("viridis_r", len(treemap_df)),
+            alpha=0.8,
+            ax=ax3,
+            text_kwargs={'fontsize': 9}
+        )
+        ax3.set_title(f'Revenue Share: Top {top_n} vs. All Other Products', fontsize=16)
+        ax3.axis('off')
+        st.pyplot(fig3)
+        st.markdown("**Insight:** This treemap reveals a critical insight: our success is not built on a few 'hero' products. The 'All Other Products' category accounts for over 80% of our revenue! This 'long tail' is the true engine of our business.")
 
     st.divider()
 
